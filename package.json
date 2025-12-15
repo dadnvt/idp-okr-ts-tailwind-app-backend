@@ -1,0 +1,22 @@
+{
+  "name": "idp-okr-ts-tailwind-app-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "goal": "node goal.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.87.1",
+    "body-parser": "^2.2.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "jwks-rsa": "^3.2.0",
+    "postgres": "^3.4.7"
+  }
+}
