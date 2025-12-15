@@ -81,25 +81,21 @@ app.put('/goals/:id', verifyCognito, async (req, res) => {
 });
 
 // API get goal by year number
-app.get('/goals', verifyCognito, async (req, res) => {
+app.get('/action-plans', verifyCognito, async (req, res) => {
   const userId = req.user.sub;
   const { year } = req.query;
 
-  const query = supabase
+  const { data, error } = await supabase
     .from('goals')
     .select(`
       *,
-      actionPlans:action_plans (*)
+      action_plans (*)
     `)
-    .eq('user_id', userId);
-
-  if (year) {
-    query = query.eq('year', Number(year));
-  }
-
-  const { data, error } = await query;
+    .eq('user_id', userId)
+    .eq('year', Number(year));
 
   if (error) {
+    console.error(error);
     return res.status(500).json({ error: error.message });
   }
 
@@ -116,9 +112,6 @@ app.post('/goals/:goalId/action-plans', verifyCognito, async (req, res) => {
     ...req.body,
     goal_id: goalId,
   };
-
-  console.log(goalId);
-  console.log(req.body);
 
   const { data, error } = await supabase
     .from('action_plans')
@@ -199,7 +192,7 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
     .from('goals')
     .select('*');
 
-    console.log(data);
+  console.log(data);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data });
 });
