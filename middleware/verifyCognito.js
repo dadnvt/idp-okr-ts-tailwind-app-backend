@@ -4,10 +4,18 @@ import jwksClient from 'jwks-rsa';
 const client = jwksClient({
   jwksUri:
     'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_ilPTEVT0U/.well-known/jwks.json',
+  // Reduce latency spikes: cache keys locally and rate-limit JWKS calls.
+  cache: true,
+  cacheMaxEntries: 5,
+  cacheMaxAge: 10 * 60 * 1000, // 10 minutes
+  rateLimit: true,
+  jwksRequestsPerMinute: 10,
 });
 
 function getKey(header, callback) {
   client.getSigningKey(header.kid, function (err, key) {
+    if (err) return callback(err);
+    if (!key) return callback(new Error('JWKS signing key not found'));
     const signingKey = key.getPublicKey();
     callback(null, signingKey);
   });

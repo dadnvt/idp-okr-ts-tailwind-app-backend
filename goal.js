@@ -8,6 +8,34 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
+// Health check (no auth) — use this to verify Nginx → Node path quickly.
+// Example from EC2: curl -i http://localhost:3000/healthz
+app.get('/healthz', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'idp-okr-backend',
+    ts: new Date().toISOString(),
+  });
+});
+
+// Optional timing logs: export LOG_TIMINGS=1 to enable.
+const LOG_TIMINGS = process.env.LOG_TIMINGS === '1';
+const SLOW_MS = Number(process.env.SLOW_MS || 800);
+const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
+
+if (LOG_TIMINGS) {
+  app.use((req, res, next) => {
+    const start = nowMs();
+    res.on('finish', () => {
+      const ms = nowMs() - start;
+      const line = `${req.method} ${req.originalUrl} -> ${res.statusCode} (${ms.toFixed(1)}ms)`;
+      if (ms >= SLOW_MS) console.warn('[SLOW]', line);
+      else console.log('[REQ]', line);
+    });
+    next();
+  });
+}
+
 function isLeaderUser(req) {
   const groups = req.user?.['cognito:groups'];
   const groupList = Array.isArray(groups)
@@ -248,17 +276,22 @@ app.get('/action-plans', verifyCognito, async (req, res) => {
   const userId = req.user.sub;
   const { year } = req.query;
 
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
   const { data, error } = await supabase
     .from('goals')
     .select(`
       *,
       action_plans (
-        *,
-        weekly_reports (*)
+        *
       )
     `)
     .eq('user_id', userId)
     .eq('year', Number(year));
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    const goals = Array.isArray(data) ? data.length : 0;
+    console.log('[DB]', `GET /action-plans supabase (${ms.toFixed(1)}ms) goals=${goals}`);
+  }
 
   if (error) {
     console.error(error);
@@ -266,6 +299,34 @@ app.get('/action-plans', verifyCognito, async (req, res) => {
   }
 
   res.json({ data });
+});
+
+// Fetch weekly reports for a specific action plan (paged)
+// GET /action-plans/:actionPlanId/weekly-reports?limit=20&offset=0
+app.get('/action-plans/:actionPlanId/weekly-reports', verifyCognito, async (req, res) => {
+  const { actionPlanId } = req.params;
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+  const offset = Math.max(0, Number(req.query.offset || 0));
+
+  const access = await assertCanAccessActionPlan(req, actionPlanId);
+  if (!access.ok) return res.status(access.status).json({ message: access.message });
+
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
+  const { data, error } = await supabase
+    .from('weekly_reports')
+    .select('*')
+    .eq('action_plan_id', actionPlanId)
+    .order('date', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    const count = Array.isArray(data) ? data.length : 0;
+    console.log('[DB]', `GET /action-plans/:id/weekly-reports supabase (${ms.toFixed(1)}ms) rows=${count} limit=${limit} offset=${offset}`);
+  }
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data, page: { limit, offset, returned: Array.isArray(data) ? data.length : 0 } });
 });
 
 
@@ -601,18 +662,79 @@ app.delete('/goals/:id', verifyCognito, async (req, res) => {
 
 // API FOR LEADER
 app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
-  const { data, error } = await supabase
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
+  const { year, user_id, limit, offset } = req.query;
+  const pageLimit = Math.max(1, Math.min(500, Number(limit || 200)));
+  const pageOffset = Math.max(0, Number(offset || 0));
+
+  let q = supabase
     .from('goals')
-    .select(`
+    .select(
+      `
       *,
       action_plans (
-        *,
-        weekly_reports (*)
+        *
       )
-    `);
+    `
+    )
+    .range(pageOffset, pageOffset + pageLimit - 1);
+
+  if (typeof year !== 'undefined' && year !== null && `${year}`.trim() !== '') {
+    q = q.eq('year', Number(year));
+  }
+  if (typeof user_id === 'string' && user_id.trim()) {
+    // Filter by goal owner (Cognito sub UUID)
+    q = q.eq('user_id', user_id.trim());
+  }
+
+  const { data, error } = await q;
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    const goals = Array.isArray(data) ? data.length : 0;
+    console.log(
+      '[DB]',
+      `GET /leader/goals supabase (${ms.toFixed(1)}ms) goals=${goals} limit=${pageLimit} offset=${pageOffset}${typeof year !== 'undefined' ? ` year=${year}` : ''}${typeof user_id === 'string' && user_id.trim() ? ` user_id=${user_id}` : ''}`
+    );
+  }
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data });
+});
+
+// Leader: list users for dropdown filters (requires `users` table: id(uuid)=cognito sub)
+// GET /leader/users?q=...&team=...&limit=200&offset=0
+app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
+  const { q, team, limit, offset } = req.query;
+  const pageLimit = Math.max(1, Math.min(500, Number(limit || 200)));
+  const pageOffset = Math.max(0, Number(offset || 0));
+
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
+
+  let query = supabase
+    .from('users')
+    .select('id, email, name, team, role')
+    .range(pageOffset, pageOffset + pageLimit - 1)
+    .order('name', { ascending: true, nullsFirst: false });
+
+  if (typeof team === 'string' && team.trim()) {
+    query = query.eq('team', team.trim());
+  }
+  if (typeof q === 'string' && q.trim()) {
+    const needle = q.trim();
+    // Supabase "or" filter for simple search
+    query = query.or(`name.ilike.%${needle}%,email.ilike.%${needle}%`);
+  }
+
+  const { data, error } = await query;
+
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    const rows = Array.isArray(data) ? data.length : 0;
+    console.log('[DB]', `GET /leader/users supabase (${ms.toFixed(1)}ms) rows=${rows} limit=${pageLimit} offset=${pageOffset}`);
+  }
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data, page: { limit: pageLimit, offset: pageOffset, returned: Array.isArray(data) ? data.length : 0 } });
 });
 
 // API leader update goal
