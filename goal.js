@@ -611,7 +611,6 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
       )
     `);
 
-  console.log(data);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data });
 });
