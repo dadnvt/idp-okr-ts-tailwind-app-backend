@@ -131,7 +131,21 @@ app.put('/goals/:id', verifyCognito, async (req, res) => {
   }
 
   if (goal.is_locked) {
-    return res.status(423).json({ message: 'Goal is locked for review' });
+    // If leader already approved the goal, allow member to update progress only.
+    // While Pending review, goal remains fully locked.
+    if (goal.review_status === 'Approved') {
+      const keys = Object.keys(updates || {});
+      const allowedKeys = new Set(['progress']);
+      const hasDisallowed = keys.some((k) => !allowedKeys.has(k));
+      if (hasDisallowed) {
+        return res
+          .status(423)
+          .json({ message: 'Goal is locked (only progress updates are allowed)' });
+      }
+      // Allowed: progress update continues below
+    } else {
+      return res.status(423).json({ message: 'Goal is locked for review' });
+    }
   }
 
   const { data, error } = await supabase
