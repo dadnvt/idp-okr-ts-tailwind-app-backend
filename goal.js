@@ -144,6 +144,20 @@ app.put('/goals/:id', verifyCognito, async (req, res) => {
   const userId = req.user.sub;
   const { user_id, ...updates } = req.body;
 
+  // Normalize progress/status rule:
+  // - Keep progress within [0, 100]
+  // - If progress reaches 100, auto set status = Completed
+  if (typeof updates?.progress !== 'undefined') {
+    const n = Number(updates.progress);
+    if (!Number.isNaN(n)) {
+      const clamped = Math.max(0, Math.min(100, n));
+      updates.progress = clamped;
+      if (clamped >= 100) {
+        updates.status = 'Completed';
+      }
+    }
+  }
+
   const { data: goal, error: fetchError } = await supabase
     .from('goals')
     .select('id, user_id, is_locked, review_status')
@@ -159,18 +173,18 @@ app.put('/goals/:id', verifyCognito, async (req, res) => {
   }
 
   if (goal.is_locked) {
-    // If leader already approved the goal, allow member to update progress only.
+    // If leader already approved the goal, allow member to update status + progress only.
     // While Pending review, goal remains fully locked.
     if (goal.review_status === 'Approved') {
       const keys = Object.keys(updates || {});
-      const allowedKeys = new Set(['progress']);
+      const allowedKeys = new Set(['progress', 'status']);
       const hasDisallowed = keys.some((k) => !allowedKeys.has(k));
       if (hasDisallowed) {
         return res
           .status(423)
-          .json({ message: 'Goal is locked (only progress updates are allowed)' });
+          .json({ message: 'Goal is locked (only status/progress updates are allowed)' });
       }
-      // Allowed: progress update continues below
+      // Allowed: status/progress update continues below
     } else {
       return res.status(423).json({ message: 'Goal is locked for review' });
     }
