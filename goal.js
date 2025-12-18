@@ -737,6 +737,120 @@ app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
   res.json({ data, page: { limit: pageLimit, offset: pageOffset, returned: Array.isArray(data) ? data.length : 0 } });
 });
 
+// Leader insights: weekly report stats per action plan for a date range
+// GET /leader/action-plans/weekly-report-stats?year=2025&user_id=<uuid>&from=YYYY-MM-DD&to=YYYY-MM-DD
+// Returns: { data: { [actionPlanId]: { lastReportDate: string|null, hasReportInRange: boolean } }, meta: {...} }
+app.get('/leader/action-plans/weekly-report-stats', verifyCognito, requireLeader, async (req, res) => {
+  const { year, user_id, from, to } = req.query;
+  const fromStr = typeof from === 'string' ? from.slice(0, 10) : null;
+  const toStr = typeof to === 'string' ? to.slice(0, 10) : null;
+
+  const isValidDateOnly = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!isValidDateOnly(fromStr) || !isValidDateOnly(toStr)) {
+    return res.status(400).json({ error: 'Query params "from" and "to" (YYYY-MM-DD) are required' });
+  }
+
+  const targetYear =
+    typeof year !== 'undefined' && year !== null && `${year}`.trim() !== '' ? Number(year) : null;
+  if (targetYear == null || Number.isNaN(targetYear)) {
+    return res.status(400).json({ error: 'Query param "year" is required' });
+  }
+
+  // 1) Find relevant action plans (goal in progress + plan in progress/blocked) for the given year/user.
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
+  let plansQ = supabase
+    .from('action_plans')
+    .select(
+      `
+      id,
+      start_date,
+      status,
+      goals!inner (
+        id,
+        user_id,
+        year,
+        status
+      )
+    `
+    )
+    .in('status', ['In Progress', 'Blocked'])
+    .eq('goals.status', 'In Progress')
+    .eq('goals.year', targetYear);
+
+  if (typeof user_id === 'string' && user_id.trim()) {
+    plansQ = plansQ.eq('goals.user_id', user_id.trim());
+  }
+
+  const { data: plans, error: plansErr } = await plansQ;
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    const count = Array.isArray(plans) ? plans.length : 0;
+    console.log('[DB]', `GET /leader/action-plans/weekly-report-stats plans (${ms.toFixed(1)}ms) rows=${count}`);
+  }
+  if (plansErr) return res.status(500).json({ error: plansErr.message });
+
+  const planIds = (plans || []).map((p) => p.id).filter(Boolean);
+  const stats = {};
+  for (const id of planIds) {
+    stats[id] = { lastReportDate: null, hasReportInRange: false };
+  }
+
+  // 2) Fetch weekly reports for those plans (chunked) and compute stats in JS.
+  const chunk = (arr, size) => {
+    const out = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  };
+
+  const t1 = LOG_TIMINGS ? nowMs() : 0;
+  let reportRows = 0;
+  for (const batch of chunk(planIds, 200)) {
+    if (batch.length === 0) continue;
+    const { data: reports, error: reportsErr } = await supabase
+      .from('weekly_reports')
+      .select('action_plan_id, date')
+      .in('action_plan_id', batch);
+
+    if (reportsErr) return res.status(500).json({ error: reportsErr.message });
+
+    for (const r of reports || []) {
+      const planId = r.action_plan_id;
+      if (!planId) continue;
+      const dateOnly = typeof r.date === 'string' ? r.date.slice(0, 10) : null;
+      if (!isValidDateOnly(dateOnly)) continue;
+
+      if (!stats[planId]) stats[planId] = { lastReportDate: null, hasReportInRange: false };
+
+      // lastReportDate (max)
+      if (!stats[planId].lastReportDate || dateOnly > stats[planId].lastReportDate) {
+        stats[planId].lastReportDate = dateOnly;
+      }
+
+      // in-range flag
+      if (dateOnly >= fromStr && dateOnly <= toStr) {
+        stats[planId].hasReportInRange = true;
+      }
+    }
+    reportRows += Array.isArray(reports) ? reports.length : 0;
+  }
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t1;
+    console.log('[DB]', `GET /leader/action-plans/weekly-report-stats reports (${ms.toFixed(1)}ms) rows=${reportRows}`);
+  }
+
+  res.json({
+    data: stats,
+    meta: {
+      year: targetYear,
+      user_id: typeof user_id === 'string' && user_id.trim() ? user_id.trim() : null,
+      from: fromStr,
+      to: toStr,
+      plans: planIds.length,
+      reports: reportRows,
+    },
+  });
+});
+
 // API leader update goal
 app.put('/leader/goals/:id', verifyCognito, requireLeader, async (req, res) => {
   const { id } = req.params;
