@@ -677,7 +677,7 @@ app.delete('/goals/:id', verifyCognito, async (req, res) => {
 // API FOR LEADER
 app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
   const t0 = LOG_TIMINGS ? nowMs() : 0;
-  const { year, user_id, limit, offset } = req.query;
+  const { year, user_id, team_id, limit, offset } = req.query;
   const pageLimit = Math.max(1, Math.min(500, Number(limit || 200)));
   const pageOffset = Math.max(0, Number(offset || 0));
 
@@ -688,6 +688,16 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
       *,
       action_plans (
         *
+      ),
+      users!inner (
+        id,
+        email,
+        name,
+        team_id,
+        teams (
+          id,
+          name
+        )
       )
     `
     )
@@ -700,6 +710,10 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
     // Filter by goal owner (Cognito sub UUID)
     q = q.eq('user_id', user_id.trim());
   }
+  if (typeof team_id === 'string' && team_id.trim()) {
+    // Filter by user's team (users.team_id -> teams.id)
+    q = q.eq('users.team_id', team_id.trim());
+  }
 
   const { data, error } = await q;
   if (LOG_TIMINGS) {
@@ -707,18 +721,33 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
     const goals = Array.isArray(data) ? data.length : 0;
     console.log(
       '[DB]',
-      `GET /leader/goals supabase (${ms.toFixed(1)}ms) goals=${goals} limit=${pageLimit} offset=${pageOffset}${typeof year !== 'undefined' ? ` year=${year}` : ''}${typeof user_id === 'string' && user_id.trim() ? ` user_id=${user_id}` : ''}`
+      `GET /leader/goals supabase (${ms.toFixed(1)}ms) goals=${goals} limit=${pageLimit} offset=${pageOffset}${typeof year !== 'undefined' ? ` year=${year}` : ''}${typeof user_id === 'string' && user_id.trim() ? ` user_id=${user_id}` : ''}${typeof team_id === 'string' && team_id.trim() ? ` team_id=${team_id}` : ''}`
     );
   }
 
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data });
+  // Backward-compatible shaping: keep existing goal fields but derive member/team from joined users/teams.
+  const shaped =
+    (data || []).map((g) => {
+      const u = g.users || null;
+      const teamObj = u?.teams || null;
+      return {
+        ...g,
+        user_name: u?.name ?? g.user_name ?? null,
+        user_email: u?.email ?? g.user_email ?? null,
+        team_id: u?.team_id ?? g.team_id ?? null,
+        team: teamObj?.name ?? g.team ?? null,
+        users: undefined,
+      };
+    }) || [];
+
+  res.json({ data: shaped });
 });
 
 // Leader: list users for dropdown filters (requires `users` table: id(uuid)=cognito sub)
 // GET /leader/users?q=...&team=...&limit=200&offset=0
 app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
-  const { q, team, limit, offset } = req.query;
+  const { q, team, team_id, limit, offset } = req.query;
   const pageLimit = Math.max(1, Math.min(500, Number(limit || 200)));
   const pageOffset = Math.max(0, Number(offset || 0));
 
@@ -726,13 +755,26 @@ app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
 
   let query = supabase
     .from('users')
-    .select('id, email, name, team, role')
+    .select(`
+      id,
+      email,
+      name,
+      team_id,
+      role,
+      teams (
+        id,
+        name
+      )
+    `)
     .range(pageOffset, pageOffset + pageLimit - 1)
     .order('name', { ascending: true, nullsFirst: false });
 
-  if (typeof team === 'string' && team.trim()) {
-    query = query.eq('team', team.trim());
-  }
+  const teamId = typeof team_id === 'string' && team_id.trim()
+    ? team_id.trim()
+    : typeof team === 'string' && team.trim()
+      ? team.trim()
+      : null;
+  if (teamId) query = query.eq('team_id', teamId);
   if (typeof q === 'string' && q.trim()) {
     const needle = q.trim();
     // Supabase "or" filter for simple search
@@ -748,7 +790,288 @@ app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
   }
 
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ data, page: { limit: pageLimit, offset: pageOffset, returned: Array.isArray(data) ? data.length : 0 } });
+  const shaped =
+    (data || []).map((u) => ({
+      id: u.id,
+      email: u.email ?? null,
+      name: u.name ?? null,
+      team_id: u.team_id ?? null,
+      team_name: u.teams?.name ?? null,
+      role: u.role ?? null,
+    })) || [];
+  res.json({ data: shaped, page: { limit: pageLimit, offset: pageOffset, returned: Array.isArray(data) ? data.length : 0 } });
+});
+
+// Leader: list teams for dropdown filters
+// GET /leader/teams
+app.get('/leader/teams', verifyCognito, requireLeader, async (req, res) => {
+  const { data, error } = await supabase
+    .from('teams')
+    .select('id, name')
+    .order('name', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [] });
+});
+
+// Leader: aggregate "growth" metrics for a member (for dashboard insights)
+// GET /leader/member-insights?year=2025&user_id=<uuid>&weeks=8
+app.get('/leader/member-insights', verifyCognito, requireLeader, async (req, res) => {
+  const { year, user_id, weeks } = req.query;
+  const targetYear = Number(year);
+  if (!targetYear || Number.isNaN(targetYear)) {
+    return res.status(400).json({ error: 'Query param "year" is required (number)' });
+  }
+  if (typeof user_id !== 'string' || !user_id.trim()) {
+    return res.status(400).json({ error: 'Query param "user_id" is required' });
+  }
+
+  const userId = user_id.trim();
+  const lookbackWeeks = Math.max(1, Math.min(26, Number(weeks || 8)));
+
+  const toDateOnly = (d) => d.toISOString().slice(0, 10);
+  const parseDateOnly = (s) => {
+    const [y, m, dd] = `${s}`.slice(0, 10).split('-').map(Number);
+    const d = new Date(y, (m || 1) - 1, dd || 1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+  const startOfWeekMonday = (d) => {
+    const date = new Date(d);
+    const day = (date.getDay() + 6) % 7; // Monday=0
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - day);
+    return date;
+  };
+  const weekKey = (d) => toDateOnly(startOfWeekMonday(d));
+
+  const now = new Date();
+  const thisWeekStart = startOfWeekMonday(now);
+  const from = new Date(thisWeekStart);
+  from.setDate(from.getDate() - (lookbackWeeks - 1) * 7);
+  const fromStr = toDateOnly(from);
+  const toStr = toDateOnly(now);
+
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
+
+  // 1) Goals for member/year
+  const { data: goals, error: goalsErr } = await supabase
+    .from('goals')
+    .select('id, user_id, year, progress, status, review_status, start_date, time_bound, updated_at')
+    .eq('user_id', userId)
+    .eq('year', targetYear);
+  if (goalsErr) return res.status(500).json({ error: goalsErr.message });
+
+  const goalIds = (goals || []).map((g) => g.id).filter(Boolean);
+  const goalProgressById = new Map((goals || []).map((g) => [g.id, Number(g.progress || 0)]));
+
+  // 2) Action plans for member/year (join via goals)
+  const { data: plans, error: plansErr } = await supabase
+    .from('action_plans')
+    .select(
+      `
+      id,
+      goal_id,
+      status,
+      start_date,
+      end_date,
+      evidence_link,
+      goals!inner (
+        user_id,
+        year
+      )
+    `
+    )
+    .eq('goals.user_id', userId)
+    .eq('goals.year', targetYear);
+  if (plansErr) return res.status(500).json({ error: plansErr.message });
+
+  // 3) Weekly reports in lookback window (via goal ids) — used for streak + blockers summary
+  const isValidDateOnly = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const chunk = (arr, size) => {
+    const out = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  };
+
+  const reports = [];
+  if (goalIds.length > 0) {
+    for (const batch of chunk(goalIds, 200)) {
+      const { data: rows, error: repErr } = await supabase
+        .from('weekly_reports')
+        .select('goal_id, action_plan_id, date, blockers_challenges')
+        .in('goal_id', batch)
+        .gte('date', fromStr)
+        .lte('date', toStr);
+      if (repErr) return res.status(500).json({ error: repErr.message });
+      for (const r of rows || []) reports.push(r);
+    }
+  }
+
+  // 4) Progress delta (avg progress this week vs previous week) using goal_progress_history
+  // Requires the user to have run the migration script.
+  let progressDelta = null;
+  try {
+    if (goalIds.length > 0) {
+      const curCutoff = now; // now
+      const prevCutoff = new Date(thisWeekStart);
+      prevCutoff.setMilliseconds(prevCutoff.getMilliseconds() - 1); // just before this week starts
+
+      // Pull enough history rows to find latest record <= each cutoff
+      const historyFrom = new Date(prevCutoff);
+      historyFrom.setDate(historyFrom.getDate() - Math.max(14, lookbackWeeks * 7));
+
+      const { data: hist, error: histErr } = await supabase
+        .from('goal_progress_history')
+        .select('goal_id, progress, recorded_at')
+        .in('goal_id', goalIds)
+        .gte('recorded_at', historyFrom.toISOString())
+        .lte('recorded_at', curCutoff.toISOString())
+        .order('recorded_at', { ascending: false });
+
+      if (!histErr) {
+        const cur = new Map();
+        const prev = new Map();
+
+        for (const row of hist || []) {
+          const gid = row.goal_id;
+          if (!gid) continue;
+          const recAt = row.recorded_at ? new Date(row.recorded_at) : null;
+          if (!recAt || Number.isNaN(recAt.getTime())) continue;
+          const p = Number(row.progress || 0);
+
+          if (!cur.has(gid)) cur.set(gid, p);
+          if (!prev.has(gid) && recAt.getTime() <= prevCutoff.getTime()) prev.set(gid, p);
+
+          if (cur.size === goalIds.length && prev.size === goalIds.length) break;
+        }
+
+        const curVals = [];
+        const prevVals = [];
+        for (const gid of goalIds) {
+          const curP = cur.has(gid) ? cur.get(gid) : goalProgressById.get(gid) ?? 0;
+          const prevP = prev.has(gid) ? prev.get(gid) : curP; // fallback: no prior record => assume unchanged
+          curVals.push(curP);
+          prevVals.push(prevP);
+        }
+
+        const avg = (xs) => (xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : 0);
+        progressDelta = Number((avg(curVals) - avg(prevVals)).toFixed(2));
+      }
+    }
+  } catch {
+    // If table doesn't exist or query fails, keep null.
+    progressDelta = null;
+  }
+
+  // --- Compute metrics ---
+  const totalGoals = (goals || []).length;
+  const approvedGoals = (goals || []).filter((g) => g.review_status === 'Approved').length;
+  const pendingGoals = (goals || []).filter((g) => !g.review_status || g.review_status === 'Pending').length;
+
+  // Health buckets (mirror frontend heuristic)
+  const msDay = 24 * 3600 * 1000;
+  const goalHealth = { onTrack: 0, atRisk: 0, highRisk: 0, stagnant: 0 };
+  for (const g of goals || []) {
+    const start = g.start_date ? new Date(g.start_date) : null;
+    const end = g.time_bound ? new Date(g.time_bound) : null;
+    const progress = Number(g.progress || 0);
+
+    // Stagnant: approved + 0% for >10 days since start (simple, stable)
+    if (g.review_status === 'Approved' && progress <= 0 && start) {
+      const days = Math.floor((now.getTime() - start.getTime()) / msDay);
+      if (days > 10) goalHealth.stagnant += 1;
+    }
+
+    if (!start || !end) continue;
+    const total = end.getTime() - start.getTime();
+    if (total <= 0) continue;
+    const elapsed = now.getTime() - start.getTime();
+    const expected = Math.min(100, Math.round((elapsed / total) * 100));
+
+    if (progress < expected - 20) goalHealth.highRisk += 1;
+    else if (progress < expected - 10) goalHealth.atRisk += 1;
+    else goalHealth.onTrack += 1;
+  }
+
+  // Action plan metrics
+  const allPlans = plans || [];
+  const totalPlans = allPlans.length;
+  const completedPlans = allPlans.filter((p) => p.status === 'Completed');
+  const completedWithEvidence = completedPlans.filter((p) => {
+    const link = typeof p.evidence_link === 'string' ? p.evidence_link.trim() : '';
+    return link.length > 0;
+  });
+  const evidenceRate =
+    completedPlans.length > 0 ? completedWithEvidence.length / completedPlans.length : 0;
+
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const overduePlans = allPlans.filter((p) => {
+    if (!p.end_date) return false;
+    const end = parseDateOnly(p.end_date);
+    if (Number.isNaN(end.getTime())) return false;
+    if (p.status === 'Completed') return false;
+    return end.getTime() < todayStart.getTime();
+  });
+
+  // Weekly activity streak (weeks with at least 1 report)
+  const weeksWithActivity = new Set();
+  const blockersCount = new Map();
+  for (const r of reports) {
+    const dateOnly = typeof r.date === 'string' ? r.date.slice(0, 10) : null;
+    if (!isValidDateOnly(dateOnly)) continue;
+    weeksWithActivity.add(weekKey(parseDateOnly(dateOnly)));
+
+    const b = typeof r.blockers_challenges === 'string' ? r.blockers_challenges.trim() : '';
+    if (b) blockersCount.set(b, (blockersCount.get(b) || 0) + 1);
+  }
+  let streakWeeks = 0;
+  for (let i = 0; i < lookbackWeeks; i++) {
+    const d = new Date(thisWeekStart);
+    d.setDate(d.getDate() - i * 7);
+    if (weeksWithActivity.has(weekKey(d))) streakWeeks += 1;
+    else break;
+  }
+
+  const topBlockers = Array.from(blockersCount.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([text, count]) => ({ text, count }));
+
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    console.log('[DB]', `GET /leader/member-insights (${ms.toFixed(1)}ms) goals=${totalGoals} plans=${totalPlans} reports=${reports.length}`);
+  }
+
+  res.json({
+    data: {
+      user_id: userId,
+      year: targetYear,
+      window: { from: fromStr, to: toStr, weeks: lookbackWeeks },
+      goals: {
+        total: totalGoals,
+        approved: approvedGoals,
+        pending: pendingGoals,
+        health: goalHealth,
+      },
+      action_plans: {
+        total: totalPlans,
+        overdue: overduePlans.length,
+        completed: completedPlans.length,
+        completed_with_evidence: completedWithEvidence.length,
+        evidence_rate: evidenceRate,
+      },
+      weekly_reports: {
+        reports_in_window: reports.length,
+        weeks_with_activity: weeksWithActivity.size,
+        streak_weeks: streakWeeks,
+        top_blockers: topBlockers,
+      },
+      // Average progress delta (percentage points) for the member this week vs previous week
+      progress_delta: progressDelta,
+    },
+  });
 });
 
 // Leader insights: weekly report stats per action plan for a date range
