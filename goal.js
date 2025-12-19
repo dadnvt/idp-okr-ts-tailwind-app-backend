@@ -122,6 +122,63 @@ app.post('/goals', verifyCognito, async (req, res) => {
   res.json({ data: data[0] });
 });
 
+async function getLatestVerificationSummaryByGoalIds(goalIds) {
+  const ids = Array.isArray(goalIds) ? goalIds.filter(Boolean) : [];
+  if (ids.length === 0) return new Map();
+
+  const { data, error } = await supabase
+    .from('verification_requests')
+    .select(
+      `
+      id,
+      goal_id,
+      status,
+      created_at,
+      verification_reviews (
+        result,
+        reviewed_at
+      )
+    `
+    )
+    .in('goal_id', ids)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    console.warn('[WARN]', 'getLatestVerificationSummaryByGoalIds failed:', error.message);
+    return new Map();
+  }
+
+  const map = new Map();
+  for (const r of data || []) {
+    const goalId = r.goal_id;
+    if (!goalId || map.has(goalId)) continue;
+    const review = Array.isArray(r.verification_reviews) ? r.verification_reviews[0] : null;
+    map.set(goalId, {
+      verification_request_id: r.id,
+      verification_status: r.status || 'Pending',
+      verification_requested_at: r.created_at || null,
+      verification_result: review?.result ?? null,
+      verification_reviewed_at: review?.reviewed_at ?? null,
+    });
+  }
+  return map;
+}
+
+function attachVerificationSummaryToGoals(goals, summaryMap) {
+  const map = summaryMap || new Map();
+  return (goals || []).map((g) => {
+    const v = map.get(g.id);
+    return {
+      ...g,
+      verification_request_id: v?.verification_request_id ?? null,
+      verification_status: v?.verification_status ?? 'NotRequested',
+      verification_requested_at: v?.verification_requested_at ?? null,
+      verification_result: v?.verification_result ?? null,
+      verification_reviewed_at: v?.verification_reviewed_at ?? null,
+    };
+  });
+}
+
 // API lấy goals theo user
 app.get('/goals', verifyCognito, async (req, res) => {
   const userId = req.user.sub;
@@ -135,7 +192,10 @@ app.get('/goals', verifyCognito, async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 
-  res.json({ data });
+  const goalIds = (data || []).map((g) => g.id);
+  const vmap = await getLatestVerificationSummaryByGoalIds(goalIds);
+  const shaped = attachVerificationSummaryToGoals(data || [], vmap);
+  res.json({ data: shaped });
 });
 
 // API Edit goal
@@ -611,6 +671,11 @@ app.put('/weekly-reports/:id', verifyCognito, async (req, res) => {
   const access = await assertCanAccessWeeklyReport(req, id);
   if (!access.ok) return res.status(access.status).json({ message: access.message });
 
+  // Only leader can update leader feedback field
+  if (!isLeaderUser(req) && typeof req.body?.lead_feedback !== 'undefined') {
+    return res.status(403).json({ message: 'Forbidden (leader feedback is leader-only)' });
+  }
+
   const { data, error } = await supabase
     .from('weekly_reports')
     .update(req.body)
@@ -774,7 +839,10 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
       };
     }) || [];
 
-  res.json({ data: shaped });
+  const goalIds = shaped.map((g) => g.id);
+  const vmap = await getLatestVerificationSummaryByGoalIds(goalIds);
+  const withVerify = attachVerificationSummaryToGoals(shaped, vmap);
+  res.json({ data: withVerify });
 });
 
 // Leader: summary stats for goals (NOT paged)
@@ -942,6 +1010,233 @@ app.get('/leader/teams', verifyCognito, requireLeader, async (req, res) => {
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ data: data || [] });
+});
+
+// --- Verifications (member submit, leader review) ---
+
+// GET /verification-templates (authenticated)
+app.get('/verification-templates', verifyCognito, async (req, res) => {
+  const { data, error } = await supabase
+    .from('verification_templates')
+    .select('id, name, category, scoring_type, criteria, required_evidence, minimum_bar')
+    .order('name', { ascending: true });
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data: data || [] });
+});
+
+// POST /verification-templates (leader only)
+app.post('/verification-templates', verifyCognito, requireLeader, async (req, res) => {
+  const leaderId = req.user.sub;
+  const { name, category, scoring_type, criteria, required_evidence, minimum_bar } = req.body || {};
+
+  if (!name || typeof name !== 'string') return res.status(400).json({ error: 'name is required' });
+
+  const payload = {
+    name: name.trim(),
+    category: typeof category === 'string' ? category.trim() : null,
+    scoring_type: typeof scoring_type === 'string' ? scoring_type : 'rubric',
+    criteria: Array.isArray(criteria) ? criteria : [],
+    required_evidence: Array.isArray(required_evidence) ? required_evidence : [],
+    minimum_bar: minimum_bar && typeof minimum_bar === 'object' ? minimum_bar : null,
+    created_by: leaderId,
+  };
+
+  const { data, error } = await supabase.from('verification_templates').insert([payload]).select('*').single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data });
+});
+
+// POST /verification-requests (member creates request)
+app.post('/verification-requests', verifyCognito, async (req, res) => {
+  const requesterId = req.user.sub;
+  const { goal_id, action_plan_id, template_id, scope, evidence_links, rubric_snapshot, member_notes } = req.body || {};
+
+  if (!goal_id || typeof goal_id !== 'string') return res.status(400).json({ error: 'goal_id is required' });
+  if (!scope || typeof scope !== 'string') return res.status(400).json({ error: 'scope is required' });
+
+  const access = await assertCanAccessGoal(req, goal_id);
+  if (!access.ok) return res.status(access.status).json({ message: access.message });
+
+  const payload = {
+    requester_id: requesterId,
+    goal_id,
+    action_plan_id: typeof action_plan_id === 'string' && action_plan_id.trim() ? action_plan_id.trim() : null,
+    template_id: typeof template_id === 'string' && template_id.trim() ? template_id.trim() : null,
+    scope: scope.trim(),
+    evidence_links: Array.isArray(evidence_links) ? evidence_links : [],
+    rubric_snapshot: rubric_snapshot && typeof rubric_snapshot === 'object' ? rubric_snapshot : {},
+    member_notes: typeof member_notes === 'string' ? member_notes : null,
+    status: 'Pending',
+  };
+
+  const { data, error } = await supabase.from('verification_requests').insert([payload]).select('*').single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ data });
+});
+
+// GET /verification-requests
+// - member: own requests
+// - leader: team-scoped queue, optional filters: status, year, user_id
+app.get('/verification-requests', verifyCognito, async (req, res) => {
+  const isLeader = isLeaderUser(req);
+  const me = req.user.sub;
+  const { year, status, user_id, team_id, limit, offset } = req.query;
+  const pageLimit = Math.max(1, Math.min(200, Number(limit || 50)));
+  const pageOffset = Math.max(0, Number(offset || 0));
+
+  let q = supabase
+    .from('verification_requests')
+    .select(
+      `
+      id,
+      requester_id,
+      goal_id,
+      action_plan_id,
+      template_id,
+      scope,
+      evidence_links,
+      status,
+      created_at,
+      updated_at,
+      goals!inner (
+        id,
+        name,
+        year,
+        user_id
+      ),
+      users!inner (
+        id,
+        name,
+        email,
+        team_id,
+        teams ( id, name )
+      )
+    `
+    )
+    .range(pageOffset, pageOffset + pageLimit - 1)
+    .order('created_at', { ascending: false });
+
+  if (!isLeader) {
+    q = q.eq('requester_id', me);
+  } else {
+    const scope = await getLeaderTeamScope(req);
+    if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
+    if (typeof team_id === 'string' && team_id.trim() && team_id.trim() !== scope.teamId) {
+      return res.status(403).json({ message: 'Forbidden (team scope)' });
+    }
+    q = q.eq('users.team_id', scope.teamId);
+    if (typeof user_id === 'string' && user_id.trim()) q = q.eq('requester_id', user_id.trim());
+  }
+
+  if (typeof year !== 'undefined' && `${year}`.trim() !== '') q = q.eq('goals.year', Number(year));
+  if (typeof status === 'string' && status.trim()) q = q.eq('status', status.trim());
+
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+
+  const shaped = (data || []).map((r) => {
+    const u = r.users || null;
+    const t = u?.teams || null;
+    return {
+      ...r,
+      member_name: u?.name ?? null,
+      member_email: u?.email ?? null,
+      team_id: u?.team_id ?? null,
+      team_name: t?.name ?? null,
+      goal: r.goals ?? null,
+      users: undefined,
+      goals: undefined,
+    };
+  });
+
+  res.json({ data: shaped, page: { limit: pageLimit, offset: pageOffset, returned: shaped.length } });
+});
+
+// GET /verification-requests/:id
+app.get('/verification-requests/:id', verifyCognito, async (req, res) => {
+  const { id } = req.params;
+  const isLeader = isLeaderUser(req);
+  const me = req.user.sub;
+
+  const { data, error } = await supabase
+    .from('verification_requests')
+    .select(
+      `
+      *,
+      verification_reviews (*),
+      goals!inner ( id, name, year, user_id ),
+      users!inner ( id, name, email, team_id, teams (id, name) )
+    `
+    )
+    .eq('id', id)
+    .single();
+  if (error || !data) return res.status(404).json({ error: 'Not found' });
+
+  if (!isLeader && data.requester_id !== me) return res.status(403).json({ message: 'Forbidden' });
+  if (isLeader) {
+    const scope = await getLeaderTeamScope(req);
+    if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
+    if (data.users?.team_id !== scope.teamId) return res.status(403).json({ message: 'Forbidden (team scope)' });
+  }
+
+  const shaped = {
+    ...data,
+    member_name: data.users?.name ?? null,
+    member_email: data.users?.email ?? null,
+    team_id: data.users?.team_id ?? null,
+    team_name: data.users?.teams?.name ?? null,
+    goal: data.goals ?? null,
+    users: undefined,
+    goals: undefined,
+  };
+
+  res.json({ data: shaped });
+});
+
+// POST /verification-requests/:id/review (leader)
+app.post('/verification-requests/:id/review', verifyCognito, requireLeader, async (req, res) => {
+  const { id } = req.params;
+  const leaderId = req.user.sub;
+  const { result, scores, leader_feedback } = req.body || {};
+
+  if (!result || !['Pass', 'NeedsWork', 'Fail'].includes(result)) {
+    return res.status(400).json({ error: 'result must be Pass/NeedsWork/Fail' });
+  }
+
+  const { data: vr, error: vrErr } = await supabase
+    .from('verification_requests')
+    .select('id, requester_id, status, users!inner (team_id)')
+    .eq('id', id)
+    .single();
+  if (vrErr || !vr) return res.status(404).json({ error: 'Not found' });
+
+  const scope = await getLeaderTeamScope(req);
+  if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
+  if (vr.users?.team_id !== scope.teamId) return res.status(403).json({ message: 'Forbidden (team scope)' });
+
+  const reviewPayload = {
+    request_id: vr.id,
+    leader_id: leaderId,
+    result,
+    scores: scores && typeof scores === 'object' ? scores : {},
+    leader_feedback: typeof leader_feedback === 'string' ? leader_feedback : null,
+  };
+
+  const { data: review, error: reviewErr } = await supabase
+    .from('verification_reviews')
+    .upsert([reviewPayload], { onConflict: 'request_id' })
+    .select('*')
+    .single();
+  if (reviewErr) return res.status(500).json({ error: reviewErr.message });
+
+  const { error: updErr } = await supabase
+    .from('verification_requests')
+    .update({ status: 'Reviewed', updated_at: new Date().toISOString() })
+    .eq('id', vr.id);
+  if (updErr) return res.status(500).json({ error: updErr.message });
+
+  res.json({ data: { review } });
 });
 
 // Leader: aggregate "growth" metrics for a member (for dashboard insights)
