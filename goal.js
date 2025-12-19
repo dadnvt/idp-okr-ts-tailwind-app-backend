@@ -675,11 +675,46 @@ app.delete('/goals/:id', verifyCognito, async (req, res) => {
 
 
 // API FOR LEADER
+async function getLeaderTeamScope(req) {
+  const leaderId = req.user?.sub;
+  if (!leaderId) return { ok: false, status: 401, message: 'Missing leader identity' };
+
+  const { data, error } = await supabase
+    .from('users')
+    .select(`
+      id,
+      team_id,
+      teams (
+        id,
+        name
+      )
+    `)
+    .eq('id', leaderId)
+    .single();
+
+  if (error || !data) return { ok: false, status: 403, message: 'Leader team scope not found' };
+  if (!data.team_id) return { ok: false, status: 403, message: 'Leader is not assigned to a team' };
+
+  return {
+    ok: true,
+    teamId: data.team_id,
+    teamName: data.teams?.name ?? null,
+  };
+}
+
 app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
   const t0 = LOG_TIMINGS ? nowMs() : 0;
   const { year, user_id, team_id, limit, offset } = req.query;
   const pageLimit = Math.max(1, Math.min(500, Number(limit || 200)));
   const pageOffset = Math.max(0, Number(offset || 0));
+
+  const scope = await getLeaderTeamScope(req);
+  if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
+
+  // If client tries to query another team, block it.
+  if (typeof team_id === 'string' && team_id.trim() && team_id.trim() !== scope.teamId) {
+    return res.status(403).json({ message: 'Forbidden (team scope)' });
+  }
 
   let q = supabase
     .from('goals')
@@ -710,10 +745,8 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
     // Filter by goal owner (Cognito sub UUID)
     q = q.eq('user_id', user_id.trim());
   }
-  if (typeof team_id === 'string' && team_id.trim()) {
-    // Filter by user's team (users.team_id -> teams.id)
-    q = q.eq('users.team_id', team_id.trim());
-  }
+  // Always enforce leader's team (multi-leader, per-team scope)
+  q = q.eq('users.team_id', scope.teamId);
 
   const { data, error } = await q;
   if (LOG_TIMINGS) {
@@ -744,12 +777,100 @@ app.get('/leader/goals', verifyCognito, requireLeader, async (req, res) => {
   res.json({ data: shaped });
 });
 
+// Leader: summary stats for goals (NOT paged)
+// GET /leader/goals/summary?year=2025&team_id=<uuid>&user_id=<uuid>
+app.get('/leader/goals/summary', verifyCognito, requireLeader, async (req, res) => {
+  const t0 = LOG_TIMINGS ? nowMs() : 0;
+  const { year, user_id, team_id } = req.query;
+
+  const scope = await getLeaderTeamScope(req);
+  if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
+
+  if (typeof team_id === 'string' && team_id.trim() && team_id.trim() !== scope.teamId) {
+    return res.status(403).json({ message: 'Forbidden (team scope)' });
+  }
+
+  const targetYear = typeof year !== 'undefined' && year !== null && `${year}`.trim() !== ''
+    ? Number(year)
+    : null;
+  if (!targetYear || Number.isNaN(targetYear)) {
+    return res.status(400).json({ error: 'Query param "year" is required (number)' });
+  }
+
+  const pageLimit = 500;
+  let offset = 0;
+  let total = 0;
+  let approved = 0;
+  let pending = 0;
+  let progressSum = 0;
+
+  while (true) {
+    let q = supabase
+      .from('goals')
+      .select(
+        `
+        id,
+        progress,
+        review_status,
+        users!inner (
+          id,
+          team_id,
+          teams (
+            id,
+            name
+          )
+        )
+      `
+      )
+      .eq('year', targetYear)
+      .range(offset, offset + pageLimit - 1);
+
+    if (typeof user_id === 'string' && user_id.trim()) {
+      q = q.eq('user_id', user_id.trim());
+    }
+    // Always enforce leader's team (multi-leader, per-team scope)
+    q = q.eq('users.team_id', scope.teamId);
+
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+
+    const rows = Array.isArray(data) ? data : [];
+    for (const g of rows) {
+      total += 1;
+      const rs = g.review_status || null;
+      if (rs === 'Approved') approved += 1;
+      if (!rs || rs === 'Pending') pending += 1;
+      progressSum += Number(g.progress || 0);
+    }
+
+    if (rows.length < pageLimit) break;
+    offset += pageLimit;
+    // Safety: avoid infinite loops if upstream misbehaves
+    if (offset > 100000) break;
+  }
+
+  const avgProgress = total > 0 ? progressSum / total : 0;
+
+  if (LOG_TIMINGS) {
+    const ms = nowMs() - t0;
+    console.log(
+      '[DB]',
+      `GET /leader/goals/summary supabase (${ms.toFixed(1)}ms) total=${total} year=${targetYear}${typeof user_id === 'string' && user_id.trim() ? ` user_id=${user_id.trim()}` : ''}${typeof team_id === 'string' && team_id.trim() ? ` team_id=${team_id.trim()}` : ''}`
+    );
+  }
+
+  res.json({ data: { total, approved, pending, avgProgress } });
+});
+
 // Leader: list users for dropdown filters (requires `users` table: id(uuid)=cognito sub)
 // GET /leader/users?q=...&team=...&limit=200&offset=0
 app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
   const { q, team, team_id, limit, offset } = req.query;
   const pageLimit = Math.max(1, Math.min(500, Number(limit || 200)));
   const pageOffset = Math.max(0, Number(offset || 0));
+
+  const scope = await getLeaderTeamScope(req);
+  if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
 
   const t0 = LOG_TIMINGS ? nowMs() : 0;
 
@@ -774,7 +895,12 @@ app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
     : typeof team === 'string' && team.trim()
       ? team.trim()
       : null;
-  if (teamId) query = query.eq('team_id', teamId);
+  if (teamId && teamId !== scope.teamId) {
+    return res.status(403).json({ message: 'Forbidden (team scope)' });
+  }
+
+  // Always enforce leader's team (multi-leader, per-team scope)
+  query = query.eq('team_id', scope.teamId);
   if (typeof q === 'string' && q.trim()) {
     const needle = q.trim();
     // Supabase "or" filter for simple search
@@ -805,9 +931,13 @@ app.get('/leader/users', verifyCognito, requireLeader, async (req, res) => {
 // Leader: list teams for dropdown filters
 // GET /leader/teams
 app.get('/leader/teams', verifyCognito, requireLeader, async (req, res) => {
+  const scope = await getLeaderTeamScope(req);
+  if (!scope.ok) return res.status(scope.status).json({ message: scope.message });
+
   const { data, error } = await supabase
     .from('teams')
     .select('id, name')
+    .eq('id', scope.teamId)
     .order('name', { ascending: true });
 
   if (error) return res.status(500).json({ error: error.message });
@@ -1204,6 +1334,30 @@ app.put('/leader/goals/:id', verifyCognito, requireLeader, async (req, res) => {
   res.json({ data });
 });
 
+async function getReviewerIdentity(req) {
+  const reviewerId = req.user?.sub ?? null;
+  if (!reviewerId) return { id: null, email: null, name: null };
+  try {
+    const { data } = await supabase
+      .from('users')
+      .select('id, email, name')
+      .eq('id', reviewerId)
+      .single();
+    return {
+      id: reviewerId,
+      email: data?.email ?? null,
+      name: data?.name ?? null,
+    };
+  } catch {
+    return { id: reviewerId, email: null, name: null };
+  }
+}
+
+function isMissingColumnError(err) {
+  const msg = (err?.message || '').toLowerCase();
+  return msg.includes('does not exist') && msg.includes('column');
+}
+
 app.put('/leader/goals/:id/review', verifyCognito, requireLeader, async (req, res) => {
   const { id } = req.params;
   const { status, comment } = req.body;
@@ -1227,15 +1381,36 @@ app.put('/leader/goals/:id/review', verifyCognito, requireLeader, async (req, re
       ? 'In Progress'
       : existing.status;
 
-  const { error } = await supabase
-    .from('goals')
-    .update({
-      review_status: status,
-      leader_review_notes: comment,
-      is_locked: lock,
-      status: nextStatus,
-    })
-    .eq('id', id);
+  const nowIso = new Date().toISOString();
+  const reviewer = await getReviewerIdentity(req);
+
+  const baseUpdate = {
+    review_status: status,
+    leader_review_notes: comment,
+    is_locked: lock,
+    status: nextStatus,
+  };
+
+  const auditUpdate = {
+    ...baseUpdate,
+    reviewed_by: reviewer.id,
+    reviewed_by_email: reviewer.email,
+    reviewed_by_name: reviewer.name,
+    reviewed_at: nowIso,
+    approved_at: status === 'Approved' ? nowIso : null,
+    rejected_at: status === 'Rejected' ? nowIso : null,
+  };
+
+  // Backward compatible: if audit columns don't exist in DB, retry with base fields only.
+  let error = null;
+  {
+    const attempt = await supabase.from('goals').update(auditUpdate).eq('id', id);
+    error = attempt.error;
+    if (error && isMissingColumnError(error)) {
+      const attempt2 = await supabase.from('goals').update(baseUpdate).eq('id', id);
+      error = attempt2.error;
+    }
+  }
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
@@ -1272,10 +1447,30 @@ app.put('/leader/action-plans/:id/review', verifyCognito, requireLeader, async (
     updatePayload.request_deadline_date = null;
   }
 
-  const { error } = await supabase
-    .from('action_plans')
-    .update(updatePayload)
-    .eq('id', id);
+  const nowIso = new Date().toISOString();
+  const reviewer = await getReviewerIdentity(req);
+
+  const baseUpdate = updatePayload;
+  const auditUpdate = {
+    ...baseUpdate,
+    reviewed_by: reviewer.id,
+    reviewed_by_email: reviewer.email,
+    reviewed_by_name: reviewer.name,
+    reviewed_at: nowIso,
+    approved_at: status === 'Approved' ? nowIso : null,
+    rejected_at: status === 'Rejected' ? nowIso : null,
+  };
+
+  // Backward compatible: if audit columns don't exist in DB, retry with base fields only.
+  let error = null;
+  {
+    const attempt = await supabase.from('action_plans').update(auditUpdate).eq('id', id);
+    error = attempt.error;
+    if (error && isMissingColumnError(error)) {
+      const attempt2 = await supabase.from('action_plans').update(baseUpdate).eq('id', id);
+      error = attempt2.error;
+    }
+  }
 
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
