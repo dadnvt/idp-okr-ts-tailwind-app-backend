@@ -49,17 +49,32 @@ export function verifyCognito(req, res, next) {
   );
 }
 
-export function requireLeader(req, res, next) {
+function getCognitoGroupList(req) {
   const groups = req.user?.['cognito:groups'];
-  const groupList = Array.isArray(groups)
-    ? groups
-    : typeof groups === 'string'
-      ? [groups]
-      : [];
+  return Array.isArray(groups) ? groups : typeof groups === 'string' ? [groups] : [];
+}
 
+export function requireLeader(req, res, next) {
+  const groupList = getCognitoGroupList(req);
   if (!groupList.includes('leader')) {
     return res.status(403).json({ message: 'Forbidden (Leader only)' });
   }
 
+  next();
+}
+
+export function requireManager(req, res, next) {
+  const groupList = getCognitoGroupList(req);
+  if (!groupList.includes('manager')) {
+    return res.status(403).json({ message: 'Forbidden (Manager only)' });
+  }
+  next();
+}
+
+export function requireLeaderOrManager(req, res, next) {
+  const groupList = getCognitoGroupList(req);
+  if (!groupList.includes('leader') && !groupList.includes('manager')) {
+    return res.status(403).json({ message: 'Forbidden (Leader/Manager only)' });
+  }
   next();
 }
