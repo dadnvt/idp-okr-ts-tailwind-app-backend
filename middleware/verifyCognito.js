@@ -1,9 +1,18 @@
 import jwt from 'jsonwebtoken';
 import jwksClient from 'jwks-rsa';
 
+function getCognitoConfig() {
+  const region = process.env.AWS_REGION || process.env.COGNITO_REGION || 'us-east-1';
+  const userPoolId = process.env.COGNITO_USER_POOL_ID || process.env.AWS_COGNITO_USER_POOL_ID || 'us-east-1_ilPTEVT0U';
+  const issuer = `https://cognito-idp.${region}.amazonaws.com/${userPoolId}`;
+  const jwksUri = `${issuer}/.well-known/jwks.json`;
+  return { region, userPoolId, issuer, jwksUri };
+}
+
+const { issuer, jwksUri } = getCognitoConfig();
+
 const client = jwksClient({
-  jwksUri:
-    'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_ilPTEVT0U/.well-known/jwks.json',
+  jwksUri,
   // Reduce latency spikes: cache keys locally and rate-limit JWKS calls.
   cache: true,
   cacheMaxEntries: 5,
@@ -34,8 +43,7 @@ export function verifyCognito(req, res, next) {
     token,
     getKey,
     {
-      issuer:
-        'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_ilPTEVT0U',
+      issuer,
       algorithms: ['RS256'],
     },
     (err, decoded) => {
