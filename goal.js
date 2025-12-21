@@ -104,11 +104,20 @@ const pool = mysql.createPool({
   ...mysqlCfg,
   waitForConnections: true,
   connectionLimit: Number(process.env.MYSQL_MAX || 10),
+  connectTimeout: Number(process.env.MYSQL_CONNECT_TIMEOUT_MS || 10_000),
+  acquireTimeout: Number(process.env.MYSQL_ACQUIRE_TIMEOUT_MS || 10_000),
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0,
   // Keep DATE columns as YYYY-MM-DD strings (avoid JS Date -> timezone shifts)
   dateStrings: ['DATE'],
   // Numbers like DECIMAL should come back as JS numbers where possible
   decimalNumbers: true,
 });
+
+// Optional DB config log (safe): export LOG_DB=1 to enable.
+if (process.env.LOG_DB === '1') {
+  console.log('[DB]', 'mysql host=', mysqlCfg.host, 'port=', mysqlCfg.port, 'db=', mysqlCfg.database, 'ssl=', Boolean(mysqlCfg.ssl));
+}
 
 async function q(sqlText, params = []) {
   const [rows] = await pool.query(sqlText, params);
@@ -178,6 +187,31 @@ app.get('/healthz', (req, res) => {
   });
 });
 
+// Public: list teams for signup dropdown
+app.get('/public/teams', async (req, res) => {
+  try {
+    const rows = await q(`select id, name from teams order by name asc`, []);
+    res.json({ data: Array.isArray(rows) ? rows : [] });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+function getGroupList(groups) {
+  return Array.isArray(groups) ? groups : typeof groups === 'string' ? [groups] : [];
+}
+
+function deriveRoleFromGroups(groups) {
+  const list = getGroupList(groups);
+  if (list.includes('manager')) return 'manager';
+  if (list.includes('leader')) return 'leader';
+  return 'member';
+}
+
+function isUuidLike(s) {
+  return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+}
+
 // Debug helper (auth required): shows Cognito identity + whether user exists in DB
 // GET /me
 app.get('/me', verifyCognito, async (req, res) => {
@@ -206,6 +240,57 @@ app.get('/me', verifyCognito, async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e), sub });
+  }
+});
+
+// Create/update user record in DB after Cognito login/signup.
+// POST /auth/ensure-user
+// Body: { email?: string, name?: string, team?: string, team_id?: string }
+app.post('/auth/ensure-user', verifyCognito, async (req, res) => {
+  const sub = req.user?.sub ?? null;
+  if (!sub) return res.status(401).json({ message: 'Missing identity (sub)' });
+
+  const body = req.body || {};
+  const email = typeof body.email === 'string' ? body.email.trim() : null;
+  const name = typeof body.name === 'string' ? body.name.trim() : null;
+  const teamIdInput = typeof body.team_id === 'string' ? body.team_id.trim() : null;
+  const teamInput = typeof body.team === 'string' ? body.team.trim() : null;
+  const groups = req.user?.['cognito:groups'] ?? null;
+  const role = deriveRoleFromGroups(groups);
+
+  try {
+    let team_id = null;
+    const key = teamIdInput || teamInput || null;
+    if (key) {
+      const t = isUuidLike(key)
+        ? await q1(`select id, name from teams where id = ? limit 1`, [key])
+        : await q1(`select id, name from teams where lower(name) = lower(?) limit 1`, [key]);
+      if (!t) {
+        return res.status(400).json({
+          message: `Team not found for "${key}". Please provide a valid team_id or team name (matches teams.name).`,
+        });
+      }
+      team_id = t.id;
+    }
+
+    await q(
+      `
+        insert into users (id, email, name, team_id, role)
+        values (?, ?, ?, ?, ?)
+        as new
+        on duplicate key update
+          email = new.email,
+          name = new.name,
+          team_id = coalesce(new.team_id, users.team_id),
+          role = new.role
+      `,
+      [sub, email, name, team_id, role]
+    );
+
+    const u = await q1(`select id, email, name, team_id, role from users where id = ? limit 1`, [sub]);
+    return res.json({ data: hydrateRow(u) });
+  } catch (e) {
+    return res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
 });
 
@@ -393,7 +478,7 @@ app.post('/goals', verifyCognito, async (req, res) => {
     const ins = buildInsert('goals', goal);
     await q(ins.sql, ins.params);
     const data = hydrateRow(await q1(`select * from goals where id = ? limit 1`, [goal.id]));
-    res.json({ data });
+  res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -432,22 +517,22 @@ app.put('/goals/:id', verifyCognito, async (req, res) => {
     if (!goal) return res.status(404).json({ message: 'Goal not found' });
     if (goal.user_id !== userId) return res.status(403).json({ message: 'Forbidden' });
 
-    if (goal.is_locked) {
-      if (goal.review_status === 'Approved') {
-        const keys = Object.keys(updates || {});
+  if (goal.is_locked) {
+    if (goal.review_status === 'Approved') {
+      const keys = Object.keys(updates || {});
         const allowedKeys = new Set(['progress', 'status']);
-        const hasDisallowed = keys.some((k) => !allowedKeys.has(k));
+      const hasDisallowed = keys.some((k) => !allowedKeys.has(k));
         if (hasDisallowed) return res.status(423).json({ message: 'Goal is locked (only status/progress updates are allowed)' });
-      } else {
-        return res.status(423).json({ message: 'Goal is locked for review' });
-      }
+    } else {
+      return res.status(423).json({ message: 'Goal is locked for review' });
     }
+  }
 
     const upd = buildUpdate('goals', { ...updates, updated_at: new Date().toISOString() }, 'where id = ?', [id]);
     await q(upd.sql, upd.params);
     const data = hydrateRow(await q1(`select * from goals where id = ? limit 1`, [id]));
     if (!data) return res.status(404).json({ message: 'Goal not found' });
-    res.json({ data });
+  res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -459,7 +544,7 @@ app.post('/goals/:id/request-review', verifyCognito, async (req, res) => {
   try {
     const goal = await q1(`select id, user_id, review_status, is_locked from goals where id = ? limit 1`, [id]);
     if (!goal) return res.status(404).json({ message: 'Goal not found' });
-    if (goal.user_id !== userId) return res.status(403).json({ message: 'Forbidden' });
+  if (goal.user_id !== userId) return res.status(403).json({ message: 'Forbidden' });
     if (goal.review_status === 'Approved') return res.status(409).json({ message: 'Goal already approved' });
 
     const anyPlan = await q1(`select id from action_plans where goal_id = ? limit 1`, [id]);
@@ -482,7 +567,7 @@ app.post('/goals/:id/cancel-review', verifyCognito, async (req, res) => {
   try {
     const goal = await q1(`select id, user_id, review_status, is_locked from goals where id = ? limit 1`, [id]);
     if (!goal) return res.status(404).json({ message: 'Goal not found' });
-    if (goal.user_id !== userId) return res.status(403).json({ message: 'Forbidden' });
+  if (goal.user_id !== userId) return res.status(403).json({ message: 'Forbidden' });
     if (goal.review_status === 'Approved') return res.status(409).json({ message: 'Goal already approved' });
 
     const upd = buildUpdate('goals', { review_status: 'Cancelled', is_locked: 0 }, 'where id = ?', [id]);
@@ -562,10 +647,10 @@ app.get('/action-plans/:actionPlanId/weekly-reports', verifyCognito, async (req,
 app.post('/goals/:goalId/action-plans', verifyCognito, async (req, res) => {
   const { goalId } = req.params;
   try {
-    const access = await assertCanAccessGoal(req, goalId);
-    if (!access.ok) return res.status(access.status).json({ message: access.message });
+  const access = await assertCanAccessGoal(req, goalId);
+  if (!access.ok) return res.status(access.status).json({ message: access.message });
 
-    if (!isLeaderUser(req)) {
+  if (!isLeaderUser(req)) {
       if (access.goal?.is_locked) return res.status(423).json({ message: 'Goal is locked for review' });
       if (access.goal?.status !== 'Not started') return res.status(409).json({ message: 'Cannot add action plans after goal has started' });
     }
@@ -587,14 +672,14 @@ app.delete('/action-plans/:id', verifyCognito, async (req, res) => {
   if (!access.ok) return res.status(access.status).json({ message: access.message });
 
   try {
-    if (!isLeaderUser(req)) {
+  if (!isLeaderUser(req)) {
       const plan = await q1(`select id, is_locked from action_plans where id = ? limit 1`, [id]);
       if (!plan) return res.status(404).json({ message: 'Action plan not found' });
-      if (plan.is_locked) return res.status(423).json({ message: 'Action plan is locked for review' });
-    }
+    if (plan.is_locked) return res.status(423).json({ message: 'Action plan is locked for review' });
+  }
 
     await q(`delete from action_plans where id = ?`, [id]);
-    res.json({ success: true });
+  res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -606,48 +691,48 @@ app.put('/action-plans/:id', verifyCognito, async (req, res) => {
   if (!access.ok) return res.status(access.status).json({ message: access.message });
 
   try {
-    let existingPlan = null;
-    if (!isLeaderUser(req)) {
+  let existingPlan = null;
+  if (!isLeaderUser(req)) {
       const plan = await q1(
         `select id, is_locked, review_status, status, start_date, end_date, request_deadline_date, deadline_change_count from action_plans where id = ? limit 1`,
         [id]
       );
       if (!plan) return res.status(404).json({ message: 'Action plan not found' });
-      existingPlan = plan;
+    existingPlan = plan;
 
-      if (plan.is_locked && plan.review_status === 'Pending') {
-        const keys = Object.keys(req.body || {});
-        const allowedKeys = new Set(['end_date']);
-        const hasDisallowed = keys.some((k) => !allowedKeys.has(k));
+    if (plan.is_locked && plan.review_status === 'Pending') {
+      const keys = Object.keys(req.body || {});
+      const allowedKeys = new Set(['end_date']);
+      const hasDisallowed = keys.some((k) => !allowedKeys.has(k));
         if (hasDisallowed) return res.status(423).json({ message: 'Action plan is locked for review (deadline-only changes allowed)' });
-      }
-
-      if (plan.review_status === 'Pending' && typeof req.body?.status !== 'undefined' && req.body.status !== plan.status) {
-        return res.status(409).json({ message: 'Cannot change status while action plan is pending review' });
-      }
     }
 
-    let updates = { ...(req.body || {}) };
-    if (!isLeaderUser(req) && existingPlan) {
-      if (typeof updates.end_date === 'string') {
-        const desired = updates.end_date;
-        const currentRequested = existingPlan.request_deadline_date || null;
-        const currentEffective = currentRequested || existingPlan.end_date;
-        if (desired && desired !== currentEffective) {
-          const count = Number(existingPlan.deadline_change_count || 0);
+    if (plan.review_status === 'Pending' && typeof req.body?.status !== 'undefined' && req.body.status !== plan.status) {
+      return res.status(409).json({ message: 'Cannot change status while action plan is pending review' });
+    }
+  }
+
+  let updates = { ...(req.body || {}) };
+  if (!isLeaderUser(req) && existingPlan) {
+    if (typeof updates.end_date === 'string') {
+      const desired = updates.end_date;
+      const currentRequested = existingPlan.request_deadline_date || null;
+      const currentEffective = currentRequested || existingPlan.end_date;
+      if (desired && desired !== currentEffective) {
+        const count = Number(existingPlan.deadline_change_count || 0);
           if (count >= 3) return res.status(409).json({ message: 'Deadline can only be changed 3 times' });
-          updates = {
-            ...updates,
-            request_deadline_date: desired,
-            deadline_change_count: count + 1,
-            review_status: 'Pending',
+        updates = {
+          ...updates,
+          request_deadline_date: desired,
+          deadline_change_count: count + 1,
+          review_status: 'Pending',
             is_locked: 1,
-            leader_review_notes: null,
-          };
-        }
-        delete updates.end_date;
+          leader_review_notes: null,
+        };
       }
+      delete updates.end_date;
     }
+  }
 
     const upd = buildUpdate('action_plans', updates, 'where id = ?', [id]);
     await q(upd.sql, upd.params);
@@ -667,7 +752,7 @@ app.post('/action-plans/:id/request-review', verifyCognito, async (req, res) => 
   try {
     const plan = await q1(`select id, review_status from action_plans where id = ? limit 1`, [id]);
     if (!plan) return res.status(404).json({ message: 'Action plan not found' });
-    if (plan.review_status === 'Approved') return res.status(409).json({ message: 'Action plan already approved' });
+  if (plan.review_status === 'Approved') return res.status(409).json({ message: 'Action plan already approved' });
     const upd = buildUpdate('action_plans', { review_status: 'Pending', is_locked: 1 }, 'where id = ?', [id]);
     await q(upd.sql, upd.params);
     const data = hydrateRow(await q1(`select * from action_plans where id = ? limit 1`, [id]));
@@ -686,7 +771,7 @@ app.post('/action-plans/:id/cancel-review', verifyCognito, async (req, res) => {
   try {
     const plan = await q1(`select id, review_status from action_plans where id = ? limit 1`, [id]);
     if (!plan) return res.status(404).json({ message: 'Action plan not found' });
-    if (plan.review_status === 'Approved') return res.status(409).json({ message: 'Action plan already approved' });
+  if (plan.review_status === 'Approved') return res.status(409).json({ message: 'Action plan already approved' });
     const upd = buildUpdate('action_plans', { review_status: null, is_locked: 0, request_deadline_date: null }, 'where id = ?', [id]);
     await q(upd.sql, upd.params);
     const data = hydrateRow(await q1(`select * from action_plans where id = ? limit 1`, [id]));
@@ -705,17 +790,17 @@ app.post('/action-plans/:actionPlanId/weekly-reports', verifyCognito, async (req
     const plan = await q1(`select id, goal_id, status from action_plans where id = ? limit 1`, [actionPlanId]);
     if (!plan) return res.status(404).json({ message: 'Action plan not found' });
 
-    if (!isLeaderUser(req)) {
+  if (!isLeaderUser(req)) {
       const goal = await q1(`select id, status from goals where id = ? limit 1`, [plan.goal_id]);
       if (!goal) return res.status(404).json({ message: 'Goal not found' });
-      const planStatus = plan.status || 'Not Started';
+    const planStatus = plan.status || 'Not Started';
       const canReport = goal.status === 'In Progress' && (planStatus === 'In Progress' || planStatus === 'Blocked');
-      if (!canReport) {
-        return res.status(409).json({
-          message: 'Weekly reports can only be added when goal is In Progress and action plan is In Progress/Blocked',
-        });
-      }
+    if (!canReport) {
+      return res.status(409).json({
+        message: 'Weekly reports can only be added when goal is In Progress and action plan is In Progress/Blocked',
+      });
     }
+  }
 
     const weeklyReport = { ...(req.body || {}), action_plan_id: actionPlanId, goal_id: plan.goal_id };
     if (!weeklyReport.id) weeklyReport.id = crypto.randomUUID();
@@ -754,7 +839,7 @@ app.delete('/weekly-reports/:id', verifyCognito, async (req, res) => {
 
   try {
     await q(`delete from weekly_reports where id = ?`, [id]);
-    res.json({ success: true });
+  res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -1995,7 +2080,7 @@ app.put('/leader/goals/:id', verifyCognito, requireLeader, async (req, res) => {
     await q(upd.sql, upd.params);
     const data = hydrateRow(await q1(`select * from goals where id = ? limit 1`, [id]));
     if (!data) return res.status(404).json({ message: 'Goal not found' });
-    res.json({ data });
+  res.json({ data });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -2053,7 +2138,7 @@ app.put('/leader/goals/:id/review', verifyCognito, requireLeader, async (req, re
       }
     }
 
-    res.json({ success: true });
+  res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
@@ -2069,10 +2154,10 @@ app.put('/leader/action-plans/:id/review', verifyCognito, requireLeader, async (
     if (!plan) return res.status(404).json({ message: 'Action plan not found' });
 
     const updatePayload = { review_status: status, leader_review_notes: comment, is_locked: lock ? 1 : 0 };
-    if (status === 'Approved' && plan.request_deadline_date) {
-      updatePayload.end_date = plan.request_deadline_date;
-      updatePayload.request_deadline_date = null;
-    }
+  if (status === 'Approved' && plan.request_deadline_date) {
+    updatePayload.end_date = plan.request_deadline_date;
+    updatePayload.request_deadline_date = null;
+  }
     if (status === 'Rejected') updatePayload.request_deadline_date = null;
 
     const nowIso = new Date().toISOString();
@@ -2100,7 +2185,7 @@ app.put('/leader/action-plans/:id/review', verifyCognito, requireLeader, async (
       }
     }
 
-    res.json({ success: true });
+  res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
